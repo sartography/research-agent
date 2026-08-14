@@ -1,0 +1,10 @@
+[project]
+name = "researchagent"
+version = "0.1.0"
+description = "Daily research agent: Kagi search + extract, RSS, and an LLM report"
+requires-python = ">=3.14"
+dependencies = [
+    "anthropic",
+    "httpx",
+    "feedparser",
+]

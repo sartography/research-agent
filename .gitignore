@@ -1,0 +1,6 @@
+.idea
+.venv
+.claude
+.env
+__pycache__
+reports
