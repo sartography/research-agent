@@ -24,13 +24,15 @@ import html
 import json
 import re
 import sys
-from urllib.parse import parse_qsl, urlencode, urlsplit
+from urllib.parse import urlsplit
 
 import feedparser
 
 import config
 import kagi
 import llm
+import state
+from state import url_key
 
 
 # --- Steps -------------------------------------------------------------------
@@ -155,6 +157,50 @@ def collect_from_feeds(feeds):
     return items
 
 
+def collect_from_event_feeds(feeds):
+    """Event feeds. Same parser as Task 5, but the window looks forward: an
+    entry's date is when the event happens, not when it was published, so an
+    event stays in for config.EVENT_WINDOW_DAYS ahead rather than behind.
+
+    Past events (the feed can carry a few) and events too far out both drop,
+    for the same reason Task 5 drops undated posts: nothing here should ever
+    grow to re-report the same listing every run.
+    """
+    items = []
+    now = dt.datetime.now(dt.timezone.utc)
+    horizon = now + dt.timedelta(days=config.EVENT_WINDOW_DAYS)
+
+    for source in feeds:
+        feed = feedparser.parse(source["url"])
+
+        if not feed.entries:
+            raise RuntimeError(
+                f"{source['name']} ({source['url']}) returned no entries: "
+                f"{feed.get('bozo_exception') or 'empty feed'}"
+            )
+
+        kept = []
+        for entry in feed.entries:
+            when = entry_date(entry)
+            if when is None or when < now or when > horizon:
+                continue
+            kept.append(
+                make_item(
+                    url=entry.get("link"),
+                    title=entry.get("title"),
+                    source_type="event",
+                    source=source,
+                    snippet=clean_snippet(entry.get("summary")),
+                    published_at=when.isoformat(),
+                )
+            )
+
+        print(f"  event  {source['name']:<32.32} {len(kept):>3} of {len(feed.entries):>3}")
+        items += kept
+
+    return items
+
+
 def parse_json_list(reply, task):
     """Read a JSON list out of a model reply.
 
@@ -166,31 +212,6 @@ def parse_json_list(reply, task):
     if start == -1 or end == -1:
         raise RuntimeError(f"{task}: expected a JSON list, got: {reply[:200]}")
     return json.loads(reply[start : end + 1])
-
-
-# Query parameters that identify a campaign rather than an article. Anything
-# starting with `utm_` goes too.
-TRACKING_PARAMS = {"fbclid", "gclid", "mc_cid", "mc_eid", "ref", "source"}
-
-
-def url_key(url):
-    """A URL reduced to what makes it the same article.
-
-    Only ever used as a dictionary key — the record keeps the URL it arrived
-    with, so nothing here can damage a link we later publish. That is what
-    makes it safe to be aggressive: scheme dropped so http and https collapse,
-    `www.` and a trailing slash dropped, tracking parameters removed, and the
-    rest sorted so parameter order stops mattering.
-    """
-    parts = urlsplit(url.strip())
-    host = parts.netloc.lower().removeprefix("www.")
-    path = parts.path.rstrip("/")
-    query = sorted(
-        (name, value)
-        for name, value in parse_qsl(parts.query)
-        if name.lower() not in TRACKING_PARAMS and not name.lower().startswith("utm_")
-    )
-    return f"{host}{path}?{urlencode(query)}" if query else f"{host}{path}"
 
 
 def metadata_score(item):
@@ -265,46 +286,34 @@ def dedupe(items):
     return deduped
 
 
-TRIAGE_PROMPT = """\
-You are screening today's reading for SpiffWorks, a company working on BPMN
-workflow orchestration and process automation. We care about: BPM and BPMN,
-workflow and orchestration engines, process automation, AI agents doing real
-work in businesses, and the vendors and analysts in that market. We also want
-breaking news, conferences and events, speaking opportunities, and blog posts
-people are actually reading.
+def drop_seen(items, label):
+    """Filter out items state.is_new() says we've already reported, and mark
+    the rest seen right away.
 
-Score each item 0 to 5 for how much it deserves a place in today's report:
+    Marking happens here, before triage, not after — a low-scoring item that
+    triage would drop anyway still gets marked, so it does not get
+    re-collected and re-scored on every future run forever. Backlog item 1.
+    """
+    new = [item for item in items if state.is_new(item["url"])]
+    for item in new:
+        state.mark_seen(item)
 
-  5 — a real development in our space: a release, a finding, a shift
-  4 — an event, conference or call for speakers 
-  3 — articles, research studies, and blog posts not directly published by a vendor
-  2 — tangential articles, research and blog posts 
-  1 — only glancingly related, or a vendor describing its own product
-  0 — unrelated, or an advert, job post, or forum question with no content
-
-Use the whole range. A score of 4 or 5 says we would notice its absence from
-the report; if fifteen items score 4, none of them did.
-
-Judge only what the title and snippet actually say. Items reached us through
-broad searches and a Hacker News feed, so most of this list is genuinely a 0.
-
-Reply with a JSON list of {count} objects, one per item, and nothing else:
-
-[{{"id": 1, "score": 0}}]
-
---- items ---
-{items}
-"""
+    skipped = len(items) - len(new)
+    if skipped:
+        print(f"  {skipped} of {len(items)} {label} already reported, skipping")
+    return new
 
 
-def triage(items):
+def triage(items, cap=None):
     """Task 8. One cheap-model call over all titles and snippets, scoring each
-    0-5. Keeps items at or above config.TRIAGE_THRESHOLD, then the top
-    config.MAX_ARTICLES by score.
+    0-5. Keeps items at or above config.TRIAGE_THRESHOLD, then the top `cap`
+    by score (config.MAX_ARTICLES if not given).
 
     The cap is the main thing keeping a run cheap: it decides how many pages
-    Task 9 extracts and how much text reaches the synthesize call.
+    Task 9 extracts and how much text reaches the synthesize call. Events use
+    their own cap (config.MAX_EVENTS) since they are never extracted.
     """
+    cap = config.MAX_ARTICLES if cap is None else cap
     if not items:
         return []
 
@@ -314,7 +323,7 @@ def triage(items):
     )
     reply = llm.ask(
         config.TRIAGE_MODEL,
-        TRIAGE_PROMPT.format(count=len(items), items=listing),
+        config.TRIAGE_PROMPT.format(count=len(items), items=listing),
     )
 
     scores = {}
@@ -347,9 +356,9 @@ def triage(items):
     )
     if len(scores) != len(items):
         print(f"  {len(items) - len(scores)} items went unscored and were treated as 0")
-    print(f"  {len(kept)} at or above threshold {config.TRIAGE_THRESHOLD}, keeping top {config.MAX_ARTICLES}")
+    print(f"  {len(kept)} at or above threshold {config.TRIAGE_THRESHOLD}, keeping top {cap}")
 
-    return kept[: config.MAX_ARTICLES]
+    return kept[:cap]
 
 
 def truncate(text):
@@ -446,60 +455,6 @@ def extract_articles(items):
     return kept
 
 
-SYNTHESIZE_PROMPT = """\
-You are writing today's research report for SpiffWorks, a company working on
-BPMN workflow orchestration and process automation. The reader works for SpiffWorks.
-They know the field, have three minutes, and want to know what happened today
-that they would otherwise have missed.  
-
-**Three minutes is the size of the report**, not an aspiration. Write to it.
-
-Below is every article that survived today's screening. It is a day's harvest
-from broad searches and a handful of feeds, so some of it is thin. That is
-expected. Report what is here.
-
-**Long pages arrive cut short.** We keep the first few thousand characters of
-each page and mark the cut `[truncated]`. That is our budget, not the author
-stopping mid-sentence, and the reader knows it already. Never mention it —
-"the post breaks off", "truncated mid-list", "we do not have the rest" are all
-noise. Simply report what the text you were given establishes, and claim
-nothing about what the rest of the page said.
-
-Write the report in Markdown. Do not add a title, a preamble, or a closing
-summary — a title and a References section are added afterwards.
-
-Summarize each article provided. **The `##` heading is the article's title as
-a link: `## [Article title](its url)`.** The URL is given with each article
-below; copy it exactly. That link is the only record of where the article came
-from, so a heading without one is a summary the reader cannot check, and it
-drops the article from the References section.
-
-Follow the heading with the source, author and a date if available.
-Lead with an overall summary of the article in plain english.  Be direct and factual.
-If there are major points in the article, summerize these with bullet points.
-
-Rules:
-
-  - **Only what the articles say.** No background you happen to know, no
-    inference dressed as fact.
-  - **State facts, not observations.** Report what an article says, not how
-    interesting it was to read. 
-  - **Say when something is vendor related.** "A vendor's product page, no detail behind
-    the announcement" is a fact about the source and belongs in the report.
-  - **Dates.** Give an article's publication date when you place it in time.
-    Some read "date unknown"; say that rather than guessing.
-
-Two budgets, and they bind:
-
-  - An article summary is 2 sentences.
-  - A bullet is one sentence. 
-  
---- articles ---
-
-{articles}
-"""
-
-
 def article_block(number, item):
     """One article as the synthesize call sees it: a header of everything we
     know about where it came from, then the text.
@@ -546,58 +501,13 @@ def synthesize(items):
     # rather than making it shorter.
     draft = llm.ask(
         config.SYNTHESIZE_MODEL,
-        SYNTHESIZE_PROMPT.format(articles=articles),
+        config.SYNTHESIZE_PROMPT.format(articles=articles),
         max_tokens=16000,
     )
 
     print(f"  {len(items)} articles ({len(articles):,} chars) -> {len(draft):,} char draft")
     return draft
 
-
-COPY_EDIT_PROMPT = """\
-Copy edit the Markdown report below, applying Strunk and White's *The Elements
-of Style*. Reply with the edited report and nothing else — no preamble, no
-notes on what you changed.
-
-Edit for these, in roughly this order of value:
-
-  - **Omit needless words.** Every sentence carries its own weight or goes.
-    "The fact that", "in order to", "it should be noted that" are always
-    deletable.
-  - **Use the active voice**, and prefer nouns and verbs to adjectives and
-    adverbs.
-  - **Put statements in positive form.** Say what something is, not what it
-    is not.
-  - **Use definite, specific, concrete language.** Prefer the particular to
-    the general.
-  - **Cut qualifiers** — very, rather, quite, somewhat, arguably, essentially.
-    They weaken what they modify.
-  - **Express coordinate ideas in similar form**, especially inside one bullet
-    list.
-  - **Put the emphatic word at the end of the sentence.**
-  - **Keep related words together**, and keep one paragraph to one topic.
-
-You are editing style, not substance. These are hard limits:
-
-  - **Change no facts.** Not a number, a name, a date, a company, or a claim.
-    Add nothing the draft does not already say, however sure of it you are.
-  - **Keep every item.** Compressing an article's coverage never means
-    deleting it. Every `[text](url)` in the draft appears in your reply,
-    pointing at the same URL; you may reword the link text. A lost link costs
-    a citation, which is worse than any sentence you could improve.
-  - **Never edit inside quotation marks.** Quoted text is verbatim from a
-    source. Fix the sentence around it instead.
-  - **Keep the structure**: the same `##` sections in the same order, and a
-    bullet stays a bullet. Section headings may be tightened.
-  - **Provenance is fact.** "Found by three independent sources", "no detail
-    behind the announcement", "no independent reporting behind either
-    placement", "date unknown" — these say how far to trust a line. They are
-    the most factual sentences in the report. Keep them, shortened.
-
---- report ---
-
-{draft}
-"""
 
 LINK_PATTERN = re.compile(r"\]\(\s*(https?://[^\s)]+)")
 
@@ -617,7 +527,7 @@ def copy_edit(draft):
     links are counted, and an edit that costs one is thrown away: the draft is
     already a publishable report, and prose is not worth a source.
     """
-    edited = llm.ask(config.COPY_EDIT_MODEL, COPY_EDIT_PROMPT.format(draft=draft), max_tokens=16000)
+    edited = llm.ask(config.COPY_EDIT_MODEL, config.COPY_EDIT_PROMPT.format(draft=draft), max_tokens=16000)
 
     before, after = find_urls(draft), find_urls(edited)
     lost = before - after
@@ -679,9 +589,43 @@ def references(edited, items):
     return "\n".join(lines)
 
 
-def render(edited, items):
-    """Task 12. Write reports/YYYY-MM-DD.md — a title, the edited body, and the
-    References section. Returns the path written.
+# dctech.events titles carry the event's own date as a trailing parenthetical
+# — "AI Agents at Work (September 9, 2026)" — which would just repeat the date
+# events_section() prints from published_at. Stripped for display only; the
+# stored title is untouched, since a differently-shaped event feed added later
+# may not carry this suffix at all.
+EVENT_TITLE_DATE = re.compile(
+    r"\s*\((?:January|February|March|April|May|June|July|August|September|October|November|December)"
+    r" \d{1,2}, \d{4}\)\s*$"
+)
+
+
+def events_section(events):
+    """The Upcoming Events section: a short, date-ordered list of events that
+    cleared triage. Built directly from the feed data rather than through
+    synthesize — a title, date and link is all there is to say about a
+    calendar listing, so there is no prose worth an LLM call for.
+
+    Kept as its own section rather than folded into the synthesized body,
+    since it answers a different question than the news does: not "what
+    happened", but "what's coming up".
+    """
+    lines = ["## Upcoming Events", ""]
+    if not events:
+        lines.append("Nothing upcoming cleared today's screening.")
+        return "\n".join(lines)
+
+    ordered = sorted(events, key=lambda item: item["published_at"])
+    for item in ordered:
+        when = dt.datetime.fromisoformat(item["published_at"]).strftime("%A, %B %d")
+        title = EVENT_TITLE_DATE.sub("", item["title"])
+        lines.append(f"- **[{title}]({item['url']})** — {when}")
+    return "\n".join(lines)
+
+
+def render(edited, items, events):
+    """Task 12. Write reports/YYYY-MM-DD.md — a title, the edited body, the
+    Upcoming Events section, and References. Returns the path written.
 
     The title belongs here rather than in the report itself. Synthesize is told
     not to write one, because the model does not know the date the run happened
@@ -697,6 +641,7 @@ def render(edited, items):
     path.write_text(
         f"# Research report — {today.strftime('%d %B %Y')}\n\n"
         f"{edited.strip()}\n\n"
+        f"{events_section(events)}\n\n"
         f"{references(edited, items)}\n"
     )
     return path
@@ -744,15 +689,24 @@ def main():
     if not check_keys():
         return 1
 
+    state.load()
+
     print("Collecting...")
     items = collect_from_search(config.SEARCH_TERMS)
     items += collect_from_feeds(config.FEEDS)
+    events = collect_from_event_feeds(config.EVENT_FEEDS)
 
     print()
     items = dedupe(items)
+    events = dedupe(events)
+
+    items = drop_seen(items, "articles")
+    events = drop_seen(events, "events")
+    state.save()
 
     print("\nTriaging...")
     items = triage(items)
+    events = triage(events, cap=config.MAX_EVENTS)
 
     print()
     show(items)
@@ -767,7 +721,7 @@ def main():
     edited = copy_edit(draft)
 
     print("\nRendering...")
-    path = render(edited, items)
+    path = render(edited, items, events)
 
     print("\n" + "=" * 78 + "\n")
     print(path.read_text())
