@@ -254,6 +254,21 @@ def merge_into(keep, other):
             keep["sources"].append(name)
 
 
+def drop_blocked(items, label):
+    """Drop items from a domain in config.BLOCKED_DOMAINS.
+
+    Runs right after collection, before dedupe or triage spend any effort on
+    them. Uses `publisher()` rather than `source_name` because the block is a
+    judgment about the site that served the page, not about the search term
+    or feed that happened to find it.
+    """
+    kept = [item for item in items if publisher(item["url"]) not in config.BLOCKED_DOMAINS]
+    dropped = len(items) - len(kept)
+    if dropped:
+        print(f"  {dropped} of {len(items)} {label} blocked by domain")
+    return kept
+
+
 def dedupe(items):
     """Task 7. Collapse duplicate URLs, keeping the richest record. Within a
     single run only — cross-run filtering needs the seen store (Backlog 1).
@@ -695,6 +710,9 @@ def main():
     items = collect_from_search(config.SEARCH_TERMS)
     items += collect_from_feeds(config.FEEDS)
     events = collect_from_event_feeds(config.EVENT_FEEDS)
+
+    items = drop_blocked(items, "articles")
+    events = drop_blocked(events, "events")
 
     print()
     items = dedupe(items)

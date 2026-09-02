@@ -247,6 +247,22 @@ MAX_ARTICLES = 10
 ARTICLE_CHAR_BUDGET = 6000
 
 
+# --- Blocklist -----------------------------------------------------------
+# Domains dropped right after collection, before dedupe or triage even see
+# them. For sites that keep surfacing through broad search terms despite
+# scoring low every time — AI-generated content farms, mainly, where the
+# title and snippet read plausibly enough to occasionally clear
+# TRIAGE_THRESHOLD but the underlying site has no original reporting. A
+# blocklist entry is a judgment about the *site*, not one bad article; add a
+# domain here only after it has shown up more than once.
+#
+# Matched against the URL's host with `www.` stripped (see `publisher()` in
+# main.py), so one entry covers every page and subpath on that host.
+BLOCKED_DOMAINS = {
+    "techdailyshot.com",
+}
+
+
 # --- Sources -----------------------------------------------------------------
 # What to research. Grouped by collector, so each list feeds exactly one step
 # of the pipeline: SEARCH_TERMS -> Task 4, FEEDS -> Task 5.
